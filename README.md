@@ -123,19 +123,132 @@ LOAN_SHARE_FAILPOINT=commit.after_replace:crash \
 $S rights --store $STORE --request r5.json     # safe retry: first receipt
 ```
 
+## loan-plan: pre-departure round-trip scheduling
+
+`loan-plan` plans one round of transport for loan batches that have not
+departed yet. It reads the loans from an existing audit input (events and
+`as_of` are ignored) plus a plan request, and emits both the complete
+schedule and the booking changes the carrier should apply. It never simulates
+transport already under way. (Without installing, use
+`python3 -m museum.plan_cli` in place of `loan-plan`.)
+
+```sh
+loan-plan --source INPUT.json --request PLAN.json --output RESULT.json
+```
+
+- **Source** is the usual audit input; only `loans` (id, object_id, start,
+  due) is used. Loan IDs must be unique and `start <= due`. The start..due
+  range (both days included) is when each object may travel.
+- **Request** has four arrays. `hubs`: sites where one transfer per leg is
+  allowed. `runs`: currently bookable runs (`run_id`, `from_site`, `to_site`,
+  `depart`, `arrive`, `capacity`); times are `YYYY-MM-DDTHH:MM:SSZ`, and
+  `capacity` is the total space offered for this round — it already includes
+  previously booked space, so old bookings are not subtracted again. Stopped
+  runs are simply absent. `batches`: `batch_id`, `home_site`, `venue_site`,
+  `exhibit_start`, `exhibit_end`, `priority`, and a non-empty `lots` list of
+  `{loan_id, units}`; a batch travels together on every run of its route and
+  each loan and each object may appear only once in the whole request.
+  `previous_bookings`: at most one per batch — `outbound`/`return` (ordered
+  run IDs, one or two per leg, no repeats), the `units` previously occupied
+  on each of those runs, and `locked`. Locked bookings must be kept exactly;
+  unlocked ones may be re-routed or re-sized but their exhibition is
+  confirmed and must still get a complete round trip.
+- **Rules** for new or kept routes alike: outbound home -> venue arriving no
+  later than `exhibit_start`; return venue -> home departing no earlier than
+  `exhibit_end`; each leg is direct or transfers once at a hub that is not an
+  endpoint of that leg, with a 1..24 hour connection (both ends included);
+  every used run's depart and arrive dates must lie inside every loan's
+  start..due window; loads of all scheduled batches sum against each run's
+  capacity.
+- **Selection.** If the confirmed batches cannot all be scheduled (locked
+  route stopped, volume changed, overload, timing), the whole round fails —
+  no partial plan. Otherwise the plan maximizes the accepted new batches'
+  priority sum, then minimizes disturbance of existing bookings (per booked
+  batch and run, |new - old| occupancy, unused side counting as zero), then
+  takes the lexicographically smallest `(batch_id, outbound, return)`
+  sequence by ascending batch ID.
+- **Result.** `bookings`: every scheduled batch with `outbound`, `return`,
+  and actual `units`, by ascending batch ID. `waitlisted`: new batch IDs that
+  did not fit, ascending. `changes`: one non-zero `{batch_id, run_id,
+  delta_units}` entry per batch/run pair (positive = book, negative =
+  cancel), sorted by batch ID then run ID; applying the whole list to the old
+  booking quantities yields exactly the new bookings. The command only
+  produces the list; it calls no external system.
+- **Exit codes.** Success is `0` and prints a one-line summary; the output
+  file is create-only (parent directories are created, existing files are
+  never overwritten). Any input, validation, infeasibility, or output error
+  exits `2`, writes `loan-plan: ...` to stderr, and leaves no output that
+  could be mistaken for a complete schedule.
+
+### Copyable example
+
+B1 is confirmed (booked 2 units on the direct run R4, adjustable); B2 is a
+new 5-point request whose loan L2 cannot travel before 2026-06-03, so B2 can
+only use R4 — which B1 fills. The planner moves B1 to the hub route R1+R2
+(its loan L1 may travel on 2026-06-02) and accepts B2. B1's unchanged return
+run R3 gets no cancel/rebook pair.
+
+```sh
+cd /path/to/project
+P="python3 -m museum.plan_cli"   # or: .venv/bin/loan-plan
+
+cat > source.json <<'JSON'
+{"as_of":"2026-05-15",
+ "loans":[{"id":"L1","object_id":"OBJ-1","borrower":"City Gallery","start":"2026-06-01","due":"2026-06-30"},
+          {"id":"L2","object_id":"OBJ-2","borrower":"History Hall","start":"2026-06-03","due":"2026-06-30"}],
+ "events":[]}
+JSON
+cat > plan.json <<'JSON'
+{"hubs":["HUB"],
+ "runs":[{"run_id":"R1","from_site":"HOME","to_site":"HUB","depart":"2026-06-02T09:00:00Z","arrive":"2026-06-02T12:00:00Z","capacity":4},
+         {"run_id":"R2","from_site":"HUB","to_site":"VENUE","depart":"2026-06-02T14:00:00Z","arrive":"2026-06-02T18:00:00Z","capacity":4},
+         {"run_id":"R3","from_site":"VENUE","to_site":"HOME","depart":"2026-06-25T09:00:00Z","arrive":"2026-06-25T17:00:00Z","capacity":4},
+         {"run_id":"R4","from_site":"HOME","to_site":"VENUE","depart":"2026-06-03T09:00:00Z","arrive":"2026-06-03T17:00:00Z","capacity":2}],
+ "batches":[{"batch_id":"B1","home_site":"HOME","venue_site":"VENUE","exhibit_start":"2026-06-05T00:00:00Z","exhibit_end":"2026-06-20T00:00:00Z","priority":1,"lots":[{"loan_id":"L1","units":2}]},
+            {"batch_id":"B2","home_site":"HOME","venue_site":"VENUE","exhibit_start":"2026-06-06T00:00:00Z","exhibit_end":"2026-06-19T00:00:00Z","priority":5,"lots":[{"loan_id":"L2","units":2}]}],
+ "previous_bookings":[{"batch_id":"B1","outbound":["R4"],"return":["R3"],"units":2,"locked":false}]}
+JSON
+
+$P --source source.json --request plan.json --output run/result.json
+#   -> stdout: {"bookings": 2, "changes": 5, "waitlisted": 0}
+#   run/result.json: B1 rerouted via ["R1","R2"] + return ["R3"], B2 on
+#   ["R4"] + ["R3"]; changes: B1/R1 +2, B1/R2 +2, B1/R4 -2, B2/R3 +2,
+#   B2/R4 +2.
+$P --source source.json --request plan.json --output run/result.json
+#   -> exit 2, "loan-plan: output already exists: run/result.json"
+```
+
 ## Verification
 
 Executed on Python 3.11.2 from the project root:
 
 ```text
 $ python3 -m unittest discover -s tests -v
-... 56 tests (13 pre-existing loan-audit tests unchanged, 43 new
-loan-share library and CLI tests) ...
-Ran 56 tests in ~2s
+... 94 tests (13 pre-existing loan-audit tests unchanged, 43 loan-share
+library and CLI tests, 38 new loan-plan library and CLI tests) ...
+Ran 94 tests in ~2s
 OK
 ```
 
-The new suites are `tests/test_share.py` (library) and
+The loan-plan suites are `tests/test_plan.py` (planning logic) and
+`tests/test_plan_cli.py` (CLI via independent `python3 -m museum.plan_cli`
+processes). Together they demonstrate: a priority-8 application that would
+consume a tight run losing to two priority-5 applications that share it, and
+losing again when one of the pair cannot complete its return leg (return
+capacity or loan end date), so a half-planned application never counts; a
+confirmed adjustable batch re-routed through a hub to admit one more new
+batch, with its unchanged runs left out of the change list; equal-score
+plans broken by booking disturbance and then by the lexicographic plan
+order; stopped runs and changed volumes on adjustable bookings producing the
+correct net changes; locked bookings kept exactly, and the whole round
+failing when a locked route is stopped, a locked volume changed, or two
+must-keep bookings overload a run no matter how they are adjusted; cross-day
+loan date edges and 1/24-hour transfer-wait edges (both ends inclusive);
+identical results when input records are reordered; create-only output that
+never overwrites an existing file; and validation errors that name the
+failing location.
+
+The loan-share suites are `tests/test_share.py` (library) and
 `tests/test_share_cli.py` (CLI via independent `python3 -m museum.share_cli`
 processes). Together they demonstrate: the full grant → issue → revoke →
 re-grant lifecycle above; permanent withdrawal of combined packages with no
