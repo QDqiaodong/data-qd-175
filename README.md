@@ -347,18 +347,166 @@ $P --source source.json --request plan.json --output run/result.json
 #   -> exit 2, "loan-plan: output already exists: run/result.json"
 ```
 
+## loan-intake: intake of approved corrections and targeted withdrawals
+
+`loan-intake` maintains a local working store for the digitization of paper
+loan and handover slips. Registrars approve corrections in batches; duty
+staff export the current data straight into `loan-audit` and can trace every
+current field back to the correction that supplies it. When a scan turns out
+to be misfiled, the correction built on it is withdrawn together with the
+corrections that declared it as their basis, while independently verified
+facts stay. The tool never modifies the original export or the source slips
+and never opens a network connection. (Without installing, use `python3 -m
+museum.intake_cli` in place of `loan-intake`.)
+
+- **Store.** One directory per working store, shared by sequential
+  processes (no concurrent writers). `init --store STORE --source
+  SOURCE.json` seeds a fresh store with the `as_of`, `loans` and `events` of
+  an existing audit input and prints `{"initialized": true}`; initializing
+  an existing store fails. The source must satisfy the same rules the store
+  keeps invariant: unique IDs per table, real `YYYY-MM-DD` dates, ISO 8601
+  event times with a timezone offset, the three known event types, every
+  event referencing a loan, and `start <= due` per loan.
+- **Snapshot.** `snapshot --store STORE --output INPUT.json` writes the
+  current data as a plain audit input — `as_of` from init, loans and events
+  sorted by ID, no correction metadata — ready for `loan-audit --input`.
+  The output is create-only (parent directories are created, an existing
+  file is never overwritten, a failed export leaves nothing behind).
+- **Explain.** `explain --store STORE --kind loan|event --id ID` prints
+  `{"row": ..., "field_sources": ...}` for a record that currently exists:
+  the row as exported, plus for each field except `id` the ID of the
+  correction that actually supplies the value (`null` for the init value;
+  an absent optional `condition_code` is not listed). Records that never
+  existed or no longer exist fail the query.
+- **Accept.** `accept --store STORE --request ACCEPT.json` takes
+  `{"request_id": "C8", "based_on": ["C3"], "changes": [...]}`. `based_on`
+  names the accepted, still-in-effect corrections this one actually relies
+  on (possibly none); two corrections writing the same field or checking
+  the same old value do not by themselves create a basis. `changes` is a
+  non-empty array with at most one entry per record. An `add` submits the
+  complete fields (except `id`) of a new loan or event; an ID from the
+  initial data or from any earlier successful `add` is never reassigned,
+  even after the adding correction is withdrawn. An `edit` names only the
+  corrected fields of a currently existing record: `expected` and `fields`
+  must name the same non-empty field set (never `id`), `expected` is
+  matched exactly against the current values before acceptance, and for the
+  optional `condition_code` a `null` in `expected` means "no such field"
+  while a `null` in `fields` removes it. Explicitly rewriting the unchanged
+  value counts as new evidence and survives withdrawal of the older source.
+  Old-value checks look at the state before this correction; reference and
+  date rules are checked after the whole correction applies, so one
+  correction may add a loan together with its events. Handover times
+  outside the loan interval are accepted — flagging them is the audit's
+  job. Missing or illegal fields, duplicate entries, unknown or withdrawn
+  bases, mismatched old values, dangling references or inverted dates
+  reject the whole correction; success prints
+  `{"request_id": "C8", "status": "accepted"}`.
+- **Withdraw.** `withdraw --store STORE --request WITHDRAW.json` takes
+  `{"request_id": "W1", "targets": ["C3", "C4"]}` and permanently withdraws
+  those in-effect corrections plus every in-effect correction that directly
+  or indirectly declared them as its basis. Each field then falls back to
+  the newest in-effect correction that explicitly supplies it, or to the
+  init value. A withdrawn `add` removes its record. Old-value checks from
+  accept time are not re-run: only the resulting current data is
+  re-validated, and if the withdrawal would leave an in-effect correction
+  pointing at a gone record, an event without its loan, or a loan with
+  inverted dates, the whole withdrawal is rejected naming those records —
+  the set is never widened silently and nothing is dropped quietly. Success
+  prints `{"request_id": "W1", "withdrawn": [...]}`, the deduplicated,
+  sorted list of everything actually withdrawn.
+- **Request IDs.** Both writes share one store-wide `request_id` space. An
+  equivalent retry of a successful request (array order irrelevant) returns
+  the original receipt without re-checking the current data — in particular
+  it never revives a withdrawn correction; the same ID with a different
+  operation or content is rejected. Failed requests consume no ID.
+- **Durability.** Each accepted write commits the whole store atomically
+  (temp file, fsync, `os.replace`, directory fsync) together with its
+  receipt, so a crash near commit leaves the complete old or the complete
+  new state — never half a correction or a receipt without its state.
+- **Exit codes.** Success is `0`. Any input, state, storage, or path error
+  exits `2`, writes `loan-intake: ...` to stderr, and leaves stdout empty.
+
+### Copyable example
+
+C1 fixes E1's handover time and location; C2 builds on C1; C3 independently
+re-verifies the same time. Withdrawing C1 cascades to C2, the location falls
+back to the init value, and the time stays on C3's evidence. Retrying C1's
+original accept credential returns its old receipt without reviving it.
+
+```sh
+cd /path/to/project
+I="python3 -m museum.intake_cli"   # or: .venv/bin/loan-intake
+
+cat > source.json <<'JSON'
+{"as_of":"2026-05-15",
+ "loans":[{"id":"L1","object_id":"OBJ-1","borrower":"City Gallery","start":"2026-05-01","due":"2026-05-20"}],
+ "events":[{"id":"E1","loan_id":"L1","type":"dispatch","time":"2026-05-02T09:00:00+00:00","location":"Museum"}]}
+JSON
+req() { cat > "$1"; }   # write stdin to a request file
+
+$I init --store store --source source.json      # -> {"initialized": true}
+echo '{"request_id":"C1","based_on":[],"changes":[{"kind":"event","id":"E1","op":"edit","expected":{"time":"2026-05-02T09:00:00+00:00","location":"Museum"},"fields":{"time":"2026-05-03T09:00:00+00:00","location":"Vault"}}]}' | req c1.json
+echo '{"request_id":"C2","based_on":["C1"],"changes":[{"kind":"loan","id":"L1","op":"edit","expected":{"borrower":"City Gallery"},"fields":{"borrower":"City Gallery Annex"}}]}' | req c2.json
+echo '{"request_id":"C3","based_on":[],"changes":[{"kind":"event","id":"E1","op":"edit","expected":{"time":"2026-05-03T09:00:00+00:00"},"fields":{"time":"2026-05-03T09:00:00+00:00"}}]}' | req c3.json
+echo '{"request_id":"W1","targets":["C1"]}' | req w1.json
+
+$I accept --store store --request c1.json   # -> accepted
+$I accept --store store --request c2.json   # -> accepted (based on C1)
+$I accept --store store --request c3.json   # -> accepted (independent)
+$I explain --store store --kind event --id E1
+#   -> time from C3, location from C1, loan_id/type from init (null)
+$I snapshot --store store --output run/audit-input.json
+python3 -m museum.cli --input run/audit-input.json --output run/audit.json
+$I withdraw --store store --request w1.json
+#   -> {"request_id": "W1", "withdrawn": ["C1", "C2"]}
+$I explain --store store --kind event --id E1
+#   -> location back to "Museum" (null source); time still C3's value
+$I accept --store store --request c1.json   # identical retry: old receipt,
+$I explain --store store --kind event --id E1   # but C1 stays withdrawn
+$I snapshot --store store --output run/audit-input.json
+#   -> exit 2, "loan-intake: output already exists: run/audit-input.json"
+```
+
+### Failure injection (for tests and drills)
+
+`LOAN_INTAKE_FAILPOINT="<name>:<action>"` injects a fault at a commit
+boundary; actions are `raise` (I/O-style error, exit 2) and `crash`
+(immediate process exit, simulating a kill). Names: `commit.before_write`,
+`commit.after_replace`.
+
 ## Verification
 
 Executed on Python 3.11.2 from the project root:
 
 ```text
 $ python3 -m unittest discover -s tests -v
-... 122 tests (13 pre-existing loan-audit tests unchanged, 43 loan-share
-library and CLI tests, 38 loan-plan library and CLI tests, 28 new
-loan-deposit library and CLI tests) ...
-Ran 122 tests in ~3s
+... 169 tests (13 pre-existing loan-audit tests unchanged, 43 loan-share
+library and CLI tests, 38 loan-plan library and CLI tests, 28 loan-deposit
+library and CLI tests, 47 new loan-intake library and CLI tests) ...
+Ran 169 tests in ~5s
 OK
 ```
+
+The loan-intake suites are `tests/test_intake.py` (store, correction and
+withdrawal logic) and `tests/test_intake_cli.py` (CLI via independent
+`python3 -m museum.intake_cli` processes). Together they demonstrate: a
+correction fixing an event time and a second field, with two dependent
+corrections chained one level each and an independent correction rewriting
+the same time after checking the old value — withdrawing the source cascades
+through both levels, the second field falls back to its init value, the time
+keeps the independent correction as its source, and retrying the original
+accept credential returns its receipt without reviving anything; a loan and
+its event added by two corrections without a declared basis, where
+withdrawing only the loan fails naming the event and withdrawing both makes
+them disappear; an independent date correction that turns a loan's interval
+inside out once another correction is withdrawn, rejected until both are
+withdrawn together; optional `condition_code` addition, removal and
+fallback; never-reassigned record IDs; stale old values rejecting a whole
+correction without consuming its request ID; conflicting and reordered
+request IDs across processes; injected commit failures and post-commit
+crashes staying atomic with retry-safe receipts; and snapshots that run
+through the real `loan-audit` (including an out-of-interval handover the
+audit flags) with create-only output protection.
 
 The loan-deposit suites are `tests/test_deposit.py` (reconciliation and
 settlement logic, testable without any file I/O) and
