@@ -14,6 +14,135 @@ All records are synthetic. This is an operational exception report, not a condit
 
 Fixture summary: 1 overdue loan, 0 loans with event exceptions.
 
+## loan-deposit: refund reconciliation and safe new refund advice
+
+`loan-deposit` settles one batch of loan-deposit refunds entirely from local
+files: it reconciles bank-confirmed refund movements against the instructions
+already handed to the bank, states which movements are confirmed, ambiguous or
+unmatched, and advises which new refunds are still safe to issue. It never
+opens a network connection and never sends, revokes or cancels a refund.
+(Without installing, use `python3 -m museum.deposit_cli` in place of
+`loan-deposit`.)
+
+```sh
+loan-deposit --loans LOANS.json --batch BATCH.json --output RESULT.json
+```
+
+- **Inputs.** The loans file is the usual audit input; only each loan's `id`
+  is read, and finance facts are never inferred from events or loan dates.
+  The batch is the complete material of one settlement run and holds exactly
+  five arrays: `assessments` (one `loan_id` + `fee_cents` per settled loan;
+  the fee may be zero or exceed the deposit, and may change on re-runs),
+  `deposits` (`deposit_id`, `loan_id`, `payer_ref`, `received_at`, `cents`;
+  one payer may fund several deposits across loans), `issued_refunds`
+  (instructions already with the bank, each tied to one original deposit and
+  never exceeding its receipt in total), `bank_paid` (bank-confirmed refund
+  movements, kept even when they cannot be related to anything), and
+  `confirmed_links` (manual `bank_id`/`refund_id` verifications). Amounts are
+  integer cents; fees are non-negative, every other amount positive, and
+  booleans are never amounts. Missing fields, wrong types, duplicate primary
+  keys, dangling references, duplicate fee rows, contradictory manual links,
+  or instructions exceeding a deposit reject the whole batch with the
+  offending record or field named.
+- **Reconciliation.** Manual links are accepted first and must still share
+  payer and amount and not predate the instruction; neither a bank row nor an
+  instruction may appear in two links. Among the remaining rows, an automatic
+  link is possible only when payer and amount match and the payment lies in
+  the inclusive 48-hour window after the instruction was sent. Finance's
+  objective is the maximum number of explainable successful bank rows. A row
+  is `matched` only when every maximum explanation settles it against the
+  same instruction; `ambiguous` when maximum explanations disagree (including
+  one leaving it empty, and including a row with a single contested
+  candidate); `unmatched` only when no maximum explanation can link it. The
+  Dulmage-Mendelsohn decomposition computes these facts without enumerating
+  explanations, so batches of dozens of interchangeable same-payer,
+  same-amount rows stay fast.
+- **Balances.** Per loan: `deposited_cents`, `fee_cents`, `paid_cents`
+  (confirmed refunds only), `reserved_cents` (all other issued instructions,
+  including receipts still in transit that may yet execute), `top_up_cents`
+  (the cash shortfall when deposits minus confirmed refunds do not cover the
+  fee), `excess_reserved_cents` (the extra exposure added by in-transit
+  instructions, kept separate from the cash top-up), and `blocking_bank_ids`.
+  Any unmatched or ambiguous bank row for a payer the loan received money
+  from blocks that loan; rows for payers with no deposit stay in the
+  reconciliation but block nobody.
+- **Suggestions.** Only unblocked loans with a positive remainder get
+  suggestions, one per deposit, each refunding no more than that deposit's
+  amount left outside its already issued instructions. Deposits are consumed
+  earliest received first, ties broken by `deposit_id`. The command only
+  prints advice; the actual instruction reaches the next batch as an
+  `issued_refunds` entry.
+- **Determinism and exit codes.** Reordering any input array never changes
+  the result. Success is `0`; any input, validation or output error is `2`
+  with a `loan-deposit: ...` stderr message and empty stdout. The output is
+  create-only (parent directories are created, an existing file is never
+  overwritten, and a failed write leaves no partial result).
+
+### Copyable example
+
+Two loans share payer `P`; each has a 400-cent refund instruction and two
+interchangeable success rows arrive, so nothing can be auto-confirmed and no
+new refund is advised. After finance manually verifies one row, the other is
+forced as well and the remaining 600 cents per loan become safe suggestions. A
+third loan's unexplained bank row stays on record without disturbing the
+others.
+
+```sh
+cd /path/to/project
+D="python3 -m museum.deposit_cli"   # or: .venv/bin/loan-deposit
+
+cat > loans.json <<'JSON'
+{"as_of":"2026-05-15",
+ "loans":[{"id":"L1","object_id":"OBJ-1","borrower":"Gallery A",
+           "start":"2026-01-01","due":"2026-12-31"},
+          {"id":"L2","object_id":"OBJ-2","borrower":"Gallery A",
+           "start":"2026-01-01","due":"2026-12-31"},
+          {"id":"L3","object_id":"OBJ-3","borrower":"Gallery B",
+           "start":"2026-01-01","due":"2026-12-31"}],
+ "events":[]}
+JSON
+cat > batch.json <<'JSON'
+{"assessments":[{"loan_id":"L1","fee_cents":0},
+                {"loan_id":"L2","fee_cents":0},
+                {"loan_id":"L3","fee_cents":0}],
+ "deposits":[{"deposit_id":"D1","loan_id":"L1","payer_ref":"P",
+              "received_at":"2026-01-01T00:00:00Z","cents":1000},
+             {"deposit_id":"D2","loan_id":"L2","payer_ref":"P",
+              "received_at":"2026-01-02T00:00:00Z","cents":1000},
+             {"deposit_id":"D3","loan_id":"L3","payer_ref":"Q",
+              "received_at":"2026-01-03T00:00:00Z","cents":1000}],
+ "issued_refunds":[{"refund_id":"R1","deposit_id":"D1",
+                    "sent_at":"2026-02-01T00:00:00Z","cents":400},
+                   {"refund_id":"R2","deposit_id":"D2",
+                    "sent_at":"2026-02-01T00:00:00Z","cents":400}],
+ "bank_paid":[{"bank_id":"B1","payer_ref":"P",
+               "paid_at":"2026-02-01T08:00:00Z","cents":400},
+              {"bank_id":"B2","payer_ref":"P",
+               "paid_at":"2026-02-01T09:00:00Z","cents":400},
+              {"bank_id":"B3","payer_ref":"Q",
+               "paid_at":"2026-03-01T09:00:00Z","cents":250}],
+ "confirmed_links":[]}
+JSON
+
+$D --loans loans.json --batch batch.json --output run/result.json
+#   -> B1 and B2 are ambiguous (each could settle R1 or R2), B3 unmatched;
+#      refund_suggestions is empty while the ambiguity stands.
+
+# Finance verifies B1 -> R1 with extra evidence; B2 is then forced to R2.
+python3 - <<'PY'
+import json
+batch = json.load(open("batch.json"))
+batch["confirmed_links"] = [{"bank_id": "B1", "refund_id": "R1"}]
+json.dump(batch, open("batch2.json", "w"))
+PY
+$D --loans loans.json --batch batch2.json --output run/result2.json
+#   -> B1, B2 matched (R1, R2); suggestions: 600 cents from D1 (loan L1)
+#      and 600 cents from D2 (loan L2); L3 stays blocked by its own B3 row.
+
+$D --loans loans.json --batch batch2.json --output run/result2.json
+#   -> exit 2, "loan-deposit: output already exists: run/result2.json"
+```
+
 ## loan-share: authorized publishing of scoped reports
 
 `loan-share` is a local, file-backed publishing tool for handing audit data to
@@ -224,11 +353,30 @@ Executed on Python 3.11.2 from the project root:
 
 ```text
 $ python3 -m unittest discover -s tests -v
-... 94 tests (13 pre-existing loan-audit tests unchanged, 43 loan-share
-library and CLI tests, 38 new loan-plan library and CLI tests) ...
-Ran 94 tests in ~2s
+... 122 tests (13 pre-existing loan-audit tests unchanged, 43 loan-share
+library and CLI tests, 38 loan-plan library and CLI tests, 28 new
+loan-deposit library and CLI tests) ...
+Ran 122 tests in ~3s
 OK
 ```
+
+The loan-deposit suites are `tests/test_deposit.py` (reconciliation and
+settlement logic, testable without any file I/O) and
+`tests/test_deposit_cli.py` (CLI via independent `python3 -m
+museum.deposit_cli` processes). Together they demonstrate: the maximum-matching
+case where a row with more candidates must not steal the only instruction a
+sibling row can settle; the inclusive 48-hour window at both boundaries;
+manual confirmation of a payment outside the automatic window; interchangeable
+same-payer rows blocking every involved loan's refund suggestions until one
+manual link forces the rest; two bank rows competing for one instruction
+staying ambiguous even though each has only that one surface candidate; a
+brute-force cross-check of the Dulmage-Mendelsohn classification against full
+enumeration on 1000 random small graphs; forty interchangeable rows handled
+without enumerating explanations and unchanged after shuffling; raised fees
+splitting the cash top-up from the in-transit excess; multi-deposit loans
+split into per-deposit suggestions in receipt order, independent of blocked
+partners; and whole-batch rejection (with the existing output preserved) for
+conflicting manual links and instructions exceeding the deposit.
 
 The loan-plan suites are `tests/test_plan.py` (planning logic) and
 `tests/test_plan_cli.py` (CLI via independent `python3 -m museum.plan_cli`
