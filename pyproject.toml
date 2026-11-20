@@ -10,6 +10,7 @@ dependencies = []
 
 [project.scripts]
 loan-audit = "museum.cli:main"
+loan-share = "museum.share_cli:main"
 
 [tool.setuptools]
 packages = ["museum"]
