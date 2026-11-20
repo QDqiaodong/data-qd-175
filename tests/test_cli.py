@@ -43,7 +43,8 @@ class CliTests(unittest.TestCase):
                              {"exceptions": 0, "loans": 2, "overdue": 0})
 
             report = json.loads(output_path.read_text())
-            self.assertEqual(set(report), {"loans", "overdue", "exceptions", "object_custody"})
+            self.assertEqual(set(report), {"loans", "overdue", "exceptions", "object_custody",
+                                           "condition_hold_violations"})
             self.assertEqual(report["object_custody"], [
                 {"object_id": "OBJ-1", "active_loan_ids": ["L1", "L2"],
                  "conflicts": [{"object_id": "OBJ-1", "new_dispatch_event_id": "d2",

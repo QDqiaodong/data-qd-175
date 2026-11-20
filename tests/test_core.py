@@ -142,5 +142,147 @@ class ObjectCustodyTests(unittest.TestCase):
             {"object_id": "OBJ-2", "active_loan_ids": ["L2"], "conflicts": []}])
 
 
+class ConditionHoldViolationTests(unittest.TestCase):
+    def test_hold_persists_across_loans_for_same_object(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1", due="2026-05-10"), _loan("L2")],
+                "events": [_event("h1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("d2", "L2", "dispatch", "2026-05-05T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [
+            {"object_id": "OBJ-1", "dispatch_event_id": "d2", "hold_event_id": "h1"}])
+
+    def test_clear_lifts_hold(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1")],
+                "events": [_event("h1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("c1", "L1", "condition", "2026-05-03T09:00:00+00:00",
+                                  condition_code="conservation_clear"),
+                           _event("d1", "L1", "dispatch", "2026-05-04T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [])
+
+    def test_other_condition_codes_do_not_change_hold_state(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1")],
+                "events": [_event("h1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("c1", "L1", "condition", "2026-05-03T09:00:00+00:00",
+                                  condition_code="stable"),
+                           _event("d1", "L1", "dispatch", "2026-05-04T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [
+            {"object_id": "OBJ-1", "dispatch_event_id": "d1", "hold_event_id": "h1"}])
+
+    def test_condition_outside_loan_range_still_affects_hold(self):
+        data = {"as_of": "2026-05-15",
+                "loans": [_loan("L1", start="2026-05-05", due="2026-05-10")],
+                "events": [_event("h1", "L1", "condition", "2026-05-01T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("d1", "L1", "dispatch", "2026-05-06T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [
+            {"object_id": "OBJ-1", "dispatch_event_id": "d1", "hold_event_id": "h1"}])
+        self.assertEqual(result["loans"][0]["exceptions"], [])
+        self.assertEqual(result["loans"][0]["condition_codes"], ["conservation_hold"])
+
+    def test_invalid_dispatch_does_not_produce_violation(self):
+        data = {"as_of": "2026-05-15",
+                "loans": [_loan("L1", start="2026-05-05", due="2026-05-10")],
+                "events": [_event("h1", "L1", "condition", "2026-05-01T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("d0", "L1", "dispatch", "2026-05-02T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [])
+        self.assertEqual(result["loans"][0]["exceptions"], ["dispatch_outside_loan"])
+
+    def test_dispatch_before_hold_same_timestamp_is_not_violation(self):
+        # d1 sorts before h1 by event ID at the same timestamp.
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1")],
+                "events": [_event("d1", "L1", "dispatch", "2026-05-02T09:00:00+00:00"),
+                           _event("h1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_hold")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [])
+
+    def test_hold_before_dispatch_same_timestamp_is_violation(self):
+        # a1 sorts before b1 by event ID at the same timestamp.
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1")],
+                "events": [_event("b1", "L1", "dispatch", "2026-05-02T09:00:00+00:00"),
+                           _event("a1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_hold")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [
+            {"object_id": "OBJ-1", "dispatch_event_id": "b1", "hold_event_id": "a1"}])
+
+    def test_clear_before_dispatch_same_timestamp_is_not_violation(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1")],
+                "events": [_event("h0", "L1", "condition", "2026-05-01T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("c1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_clear"),
+                           _event("d2", "L1", "dispatch", "2026-05-02T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [])
+
+    def test_multiple_holds_use_latest_hold_as_source(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1")],
+                "events": [_event("h1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("h2", "L1", "condition", "2026-05-03T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("d1", "L1", "dispatch", "2026-05-04T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [
+            {"object_id": "OBJ-1", "dispatch_event_id": "d1", "hold_event_id": "h2"}])
+
+    def test_hold_is_per_object_not_global(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1", object_id="OBJ-1"),
+                          _loan("L2", object_id="OBJ-2")],
+                "events": [_event("h1", "L1", "condition", "2026-05-02T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("d2", "L2", "dispatch", "2026-05-03T09:00:00+00:00"),
+                           _event("d1", "L1", "dispatch", "2026-05-04T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [
+            {"object_id": "OBJ-1", "dispatch_event_id": "d1", "hold_event_id": "h1"}])
+
+    def test_violations_sorted_by_object_then_dispatch_time(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1", object_id="OBJ-2"),
+                          _loan("L2", object_id="OBJ-1"),
+                          _loan("L3", object_id="OBJ-1")],
+                "events": [_event("h1", "L1", "condition", "2026-05-01T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("h2", "L2", "condition", "2026-05-01T09:00:00+00:00",
+                                  condition_code="conservation_hold"),
+                           _event("d1", "L3", "dispatch", "2026-05-03T09:00:00+00:00"),
+                           _event("d2", "L2", "dispatch", "2026-05-02T09:00:00+00:00"),
+                           _event("d3", "L1", "dispatch", "2026-05-04T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [
+            {"object_id": "OBJ-1", "dispatch_event_id": "d2", "hold_event_id": "h2"},
+            {"object_id": "OBJ-1", "dispatch_event_id": "d1", "hold_event_id": "h2"},
+            {"object_id": "OBJ-2", "dispatch_event_id": "d3", "hold_event_id": "h1"}])
+
+    def test_empty_violations_when_no_hold(self):
+        data = {"as_of": "2026-05-08",
+                "loans": [_loan("L1")],
+                "events": [_event("d1", "L1", "dispatch", "2026-05-02T09:00:00+00:00")]}
+        result = audit(data)
+        self.assertEqual(result["condition_hold_violations"], [])
+
+    def test_fixture_has_no_hold_violations(self):
+        result = audit(json.loads(Path("fixtures/input.json").read_text()))
+        self.assertEqual(result["condition_hold_violations"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,38 @@ def _object_custody(loans, events):
     ]
 
 
+def _condition_hold_violations(loans, events):
+    """List valid dispatches that occur while their object is on conservation hold."""
+    object_ids = {loan["object_id"] for loan in loans.values()}
+    per_object = {object_id: [] for object_id in object_ids}
+    for event in events:
+        loan = loans[event["loan_id"]]
+        stamp = datetime.fromisoformat(event["time"])
+        if event["type"] == "condition":
+            per_object[loan["object_id"]].append((stamp, event))
+        elif event["type"] == "dispatch":
+            start, due = date.fromisoformat(loan["start"]), date.fromisoformat(loan["due"])
+            if start <= stamp.date() <= due:
+                per_object[loan["object_id"]].append((stamp, event))
+
+    violations = []
+    for object_id in sorted(object_ids):
+        hold_event_id = None
+        stream = sorted(per_object[object_id], key=lambda item: (item[0], item[1]["id"]))
+        for _, event in stream:
+            if event["type"] == "condition":
+                code = event.get("condition_code")
+                if code == "conservation_hold":
+                    hold_event_id = event["id"]
+                elif code == "conservation_clear":
+                    hold_event_id = None
+            elif hold_event_id is not None:
+                violations.append({"object_id": object_id,
+                                   "dispatch_event_id": event["id"],
+                                   "hold_event_id": hold_event_id})
+    return violations
+
+
 def audit(data):
     as_of = date.fromisoformat(data["as_of"])
     loans = {x["id"]: x for x in data["loans"]}
@@ -84,4 +116,5 @@ def audit(data):
                        "exceptions": sorted(set(exceptions)), "timeline": [e["id"] for e in timeline]})
     return {"loans": result, "overdue": sum(x["status"] == "overdue" for x in result),
             "exceptions": sum(bool(x["exceptions"]) for x in result),
-            "object_custody": _object_custody(loans, events)}
+            "object_custody": _object_custody(loans, events),
+            "condition_hold_violations": _condition_hold_violations(loans, events)}
