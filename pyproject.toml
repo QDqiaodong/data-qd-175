@@ -14,6 +14,7 @@ loan-share = "museum.share_cli:main"
 loan-plan = "museum.plan_cli:main"
 loan-deposit = "museum.deposit_cli:main"
 loan-intake = "museum.intake_cli:main"
+loan-heat = "museum.heat_cli:main"
 
 [tool.setuptools]
 packages = ["museum"]

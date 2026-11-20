@@ -474,16 +474,215 @@ boundary; actions are `raise` (I/O-style error, exit 2) and `crash`
 (immediate process exit, simulating a kill). Names: `commit.before_write`,
 `commit.after_replace`.
 
+## loan-heat: post-loan temperature evidence and probe health
+
+`loan-heat` turns one transport batch's temperature export into the two
+reports the return workflow needs: a per-loan release/review/quarantine
+decision for the conservator, and per-probe health statistics for the device
+team. It is entirely local and read-only: no network, no changes to any
+input. (Without installing, use `python3 -m museum.heat_cli` in place of
+`loan-heat`.)
+
+```sh
+loan-heat --source SOURCE.json --manifest MANIFEST.json \
+          --samples SAMPLES.ndjson --scratch DIR --output RESULT.json
+```
+
+- **Identity only from the audit input.** `SOURCE.json` is the usual
+  audit input; only each loan's `id` and `object_id` are read. Unique loan
+  IDs are checked. Packing times are never inferred from loan dates, handover
+  events or the audit date; the conservator-approved `placements` in the
+  manifest are the packing record.
+- **Manifest.** `MANIFEST.json` is the complete material of one transport
+  batch: `start`, `end`, `probes`, `limits`, `placements`. All timestamps are
+  real `YYYY-MM-DDTHH:MM:SSZ`; every interval is left-closed/right-open and
+  has positive length; temperatures are integer milli-degrees Celsius and a
+  boolean is never an integer; identifiers are non-empty strings. Each probe
+  has a unique `probe_id`, a positive `hold_seconds` and a `calibrations`
+  array. Calibrations of one probe never overlap (they may be adjacent, have
+  gaps, or be empty), and the corrected temperature is the raw reading plus
+  the offset in force. Each `limits` row names a participating loan, its
+  allowed `ceiling_milli` and the positive `alarm_seconds`; a participating
+  loan has at least one placement and non-participating loans never appear in
+  the result. Each placement lies inside the batch, carries at least two
+  distinct listed probes, and placements of the same object never overlap
+  (even across loans); different loans may share probes.
+- **Samples.** `SAMPLES.ndjson` is UTF-8 NDJSON; each line is
+  `{"probe_id","at","reading_milli"}`, where `reading_milli` may be `null`
+  for a reported probe fault. An empty file is valid. Every line is
+  validated even outside the batch window, and only listed probes may be
+  referenced. `--samples -` reads standard input, exactly once; file input is
+  also read once.
+- **Duplicates and collisions.** Same probe and same instant with identical
+  readings is one sample. Any differing readings, including a reading mixed
+  with a fault, make that instant a *collision*: no row is chosen and no
+  earlier good reading is carried forward.
+- **Support and probe health.** A sample supports its instant until
+  `hold_seconds` later or the probe's next sample, whichever is first; a
+  sample before `start` may still support the opening of the batch, while
+  samples at or after `end` never count. Faults and collisions cut off prior
+  readings like any other sample. Each batch second of each probe is exactly
+  one of: `stale` (no supporting sample), `collision`, `fault`, a normal
+  reading with no valid calibration (`uncalibrated`), or `usable`. A
+  calibration switch inside one reading's support splits it and can change
+  its corrected temperature. The five counts always sum to the batch length.
+  This is reported for every probe in the manifest, even if no placement uses
+  it.
+- **Loan evidence.** Only a loan's actual placements are judged. A span has
+  enough evidence when at least two of that placement's probes are `usable`
+  there; then it is confirmed hot only if *every* usable probe is strictly
+  above the ceiling, confirmed cool if none is, and insufficient evidence if
+  the usable probes disagree. Fewer than two usable probes is always
+  insufficient. A confirmed-hot run may continue across adjacent
+  placements, even with a new box or new probes; an unpacked gap, an
+  insufficient-evidence span, a confirmed-cool span or any other break ends
+  it.
+- **Decision.** `isolate` when the longest confirmed-hot run reaches
+  `alarm_seconds`; otherwise `review` when any monitored second is
+  insufficient evidence; otherwise `release`.
+- **Result.** A JSON object. `probe_health` has one row per probe
+  (`probe_id`, `usable`, `uncalibrated`, `fault`, `collision`, `stale`),
+  sorted by `probe_id`. `loans` has one row per participating loan
+  (`loan_id`, `monitored_seconds` = packed seconds, `uncertain_seconds`,
+  `longest_hot_seconds` and `longest_hot_start` — the earliest start among
+  equal longest runs, or `0`/`null` when nothing is confirmed hot — and
+  `decision`), sorted by `loan_id`.
+- **Determinism and resources.** Reordering sample rows or any manifest
+  array never changes the result. The export is validated in one streaming
+  pass and externally sorted in a per-run directory under `--scratch` (the
+  system temp directory by default), so a 2,000,000-line export with 64
+  probes and 2,000 placements runs in well under 160 MiB of resident memory.
+  Temporary files are created and removed per run; other files in `--scratch`
+  are never touched. Success is exit `0`; any structure, reference, time,
+  path or output error is exit `2` with a `loan-heat: ...` stderr message
+  naming the file/line/field, empty stdout, no partial output, and the source
+  untouched.
+
+### Copyable example
+
+Three loans return in one batch. `P4` reports two different readings at the
+same instant (a collision) and then a fault; `P3` loses its calibration
+halfway through. Loan 1 is released, loan 2 needs review because `P3` became
+unusable, and loan 3 is quarantined by a confirmed hot run.
+
+```sh
+cd /path/to/project
+H="python3 -m museum.heat_cli"   # or: .venv/bin/loan-heat
+
+cat > source.json <<'JSON'
+{"as_of":"2026-06-30",
+ "loans":[{"id":"L1","object_id":"OBJ-1","borrower":"Gallery A",
+           "start":"2026-06-01","due":"2026-06-20"},
+          {"id":"L2","object_id":"OBJ-2","borrower":"Gallery A",
+           "start":"2026-06-01","due":"2026-06-20"},
+          {"id":"L3","object_id":"OBJ-3","borrower":"Gallery B",
+           "start":"2026-06-01","due":"2026-06-20"}],
+ "events":[]}
+JSON
+cat > manifest.json <<'JSON'
+{"start":"2026-06-24T10:00:00Z","end":"2026-06-24T10:01:00Z",
+ "probes":[
+  {"probe_id":"P1","hold_seconds":20,
+   "calibrations":[{"start":"2026-06-24T09:00:00Z","end":"2026-06-24T11:00:00Z","offset_milli":0}]},
+  {"probe_id":"P2","hold_seconds":20,
+   "calibrations":[{"start":"2026-06-24T09:00:00Z","end":"2026-06-24T11:00:00Z","offset_milli":0}]},
+  {"probe_id":"P3","hold_seconds":20,
+   "calibrations":[{"start":"2026-06-24T09:00:00Z","end":"2026-06-24T10:00:30Z","offset_milli":0}]},
+  {"probe_id":"P4","hold_seconds":20,"calibrations":[]}],
+ "limits":[{"loan_id":"L1","ceiling_milli":20000,"alarm_seconds":30},
+           {"loan_id":"L2","ceiling_milli":20000,"alarm_seconds":30},
+           {"loan_id":"L3","ceiling_milli":20000,"alarm_seconds":15}],
+ "placements":[
+  {"loan_id":"L1","start":"2026-06-24T10:00:00Z","end":"2026-06-24T10:00:20Z","probe_ids":["P1","P2"]},
+  {"loan_id":"L2","start":"2026-06-24T10:00:20Z","end":"2026-06-24T10:00:40Z","probe_ids":["P1","P3"]},
+  {"loan_id":"L3","start":"2026-06-24T10:00:40Z","end":"2026-06-24T10:01:00Z","probe_ids":["P1","P2"]}]}
+JSON
+cat > samples.ndjson <<'JSON'
+{"probe_id":"P1","at":"2026-06-24T10:00:00Z","reading_milli":19000}
+{"probe_id":"P2","at":"2026-06-24T10:00:00Z","reading_milli":19000}
+{"probe_id":"P4","at":"2026-06-24T10:00:00Z","reading_milli":21000}
+{"probe_id":"P4","at":"2026-06-24T10:00:00Z","reading_milli":20000}
+{"probe_id":"P1","at":"2026-06-24T10:00:20Z","reading_milli":19000}
+{"probe_id":"P2","at":"2026-06-24T10:00:20Z","reading_milli":19000}
+{"probe_id":"P3","at":"2026-06-24T10:00:20Z","reading_milli":19000}
+{"probe_id":"P4","at":"2026-06-24T10:00:20Z","reading_milli":null}
+{"probe_id":"P1","at":"2026-06-24T10:00:40Z","reading_milli":21000}
+{"probe_id":"P2","at":"2026-06-24T10:00:40Z","reading_milli":21000}
+JSON
+
+$H --source source.json --manifest manifest.json \
+   --samples samples.ndjson --scratch run/scratch --output run/result.json
+#   -> stdout {"isolate": 1, "loans": 3, "probes": 4, "release": 1,
+#              "review": 1}
+#   -> loans: L1 release (20 s), L2 review (10 s uncertain after P3's
+#      calibration ends), L3 isolate (20 s hot from 10:00:40Z, alarm 15).
+#   -> probe_health: P3 uncalibrated 10 / stale 40; P4 collision 20 /
+#      fault 20 / stale 20.
+
+cat samples.ndjson | $H --source source.json --manifest manifest.json \
+   --samples - --scratch run/scratch --output run/result2.json
+#   -> same result; stdin is read exactly once.
+
+$H --source source.json --manifest manifest.json \
+   --samples samples.ndjson --scratch run/scratch --output run/result.json
+#   -> exit 2, "loan-heat: output already exists: run/result.json"
+```
+
+### Scale check
+
+The command is designed for the on-site machine's 160 MiB resident limit.
+To reproduce the shape of a large batch (64 probes, 2,000 placements, two
+million exported lines), generate a fixture and measure the peak:
+
+```sh
+python3 - <<'PY'
+import json, random, datetime
+random.seed(7)
+base = 1782295200                      # 2026-06-24T10:00:00Z
+def ts(s):
+    return (datetime.datetime(1970, 1, 1)
+            + datetime.timedelta(seconds=s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+probes = [{"probe_id": f"P{i:02d}", "hold_seconds": 60,
+           "calibrations": [{"start": "2026-06-24T00:00:00Z",
+                             "end": "2026-06-26T00:00:00Z",
+                             "offset_milli": 0}]} for i in range(64)]
+loans = [{"id": f"L{i:04d}", "object_id": f"O{i:04d}", "borrower": "b",
+          "start": "2026-06-01", "due": "2026-06-20"} for i in range(500)]
+limits = [{"loan_id": f"L{i:04d}", "ceiling_milli": 20000,
+           "alarm_seconds": 600} for i in range(500)]
+placements = [{"loan_id": f"L{n % 500:04d}", "start": ts(base + n * 60),
+               "end": ts(base + n * 60 + 60),
+               "probe_ids": [f"P{n % 64:02d}", f"P{(n + 7) % 64:02d}"]}
+              for n in range(2000)]
+json.dump({"start": ts(base), "end": ts(base + 120000), "probes": probes,
+           "limits": limits, "placements": placements},
+          open("big-manifest.json", "w"))
+json.dump({"as_of": "2026-06-30", "loans": loans, "events": []},
+          open("big-source.json", "w"))
+with open("big-samples.ndjson", "w") as fh:
+    for _ in range(2_000_000):
+        fh.write('{"probe_id":"P%02d","at":"%s","reading_milli":%d}\n' % (
+            random.randrange(64), ts(base + random.randrange(120000)),
+            random.randrange(18000, 22000)))
+PY
+/usr/bin/time -v $H --source big-source.json --manifest big-manifest.json \
+   --samples big-samples.ndjson --scratch run/scratch \
+   --output run/big-result.json 2>&1 | grep 'Maximum resident'
+#   -> Maximum resident set size: about 68 MiB on the build machine, in
+#      ~17 s, comfortably under the 160 MiB limit.
+```
+
 ## Verification
 
 Executed on Python 3.11.2 from the project root:
 
 ```text
 $ python3 -m unittest discover -s tests -v
-... 169 tests (13 pre-existing loan-audit tests unchanged, 43 loan-share
+... 203 tests (13 pre-existing loan-audit tests unchanged, 43 loan-share
 library and CLI tests, 38 loan-plan library and CLI tests, 28 loan-deposit
-library and CLI tests, 47 new loan-intake library and CLI tests) ...
-Ran 169 tests in ~5s
+library and CLI tests, 47 loan-intake library and CLI tests, 38 new loan-heat
+library and CLI tests) ...
+Ran 207 tests in ~4s
 OK
 ```
 
@@ -543,6 +742,24 @@ loan date edges and 1/24-hour transfer-wait edges (both ends inclusive);
 identical results when input records are reordered; create-only output that
 never overwrites an existing file; and validation errors that name the
 failing location.
+
+The loan-heat suites are `tests/test_heat.py` (library) and
+`tests/test_heat_cli.py` (CLI via independent `python3 -m museum.heat_cli`
+processes). Together they demonstrate: out-of-order rows and identical
+same-instant duplicates collapsing to one sample while differing readings
+(including a reading beside a fault) stay a collision; hold expiry, the
+pre-batch carry, samples at the batch end, calibration gaps and offset
+switches splitting one reading and changing its corrected temperature, with
+the five health classes always summing to the batch length; the same
+placement data flipping from `release` to `review` once the second probe
+loses its calibration; a box change keeping a confirmed-hot run contiguous
+while an evidence gap truncates it, and a run reaching the alarm despite an
+uncertain stretch; every probe reported even without a placement; whole-input
+reordering and a deliberately tiny external-sort chunk size leaving the
+result unchanged; a 40-batch randomized comparison against an independent
+second-by-second model; single-read stdin, a trailing bad line failing
+without output or scratch leftovers, scratch files shared only under this
+run, and create-only output protection.
 
 The loan-share suites are `tests/test_share.py` (library) and
 `tests/test_share_cli.py` (CLI via independent `python3 -m museum.share_cli`
