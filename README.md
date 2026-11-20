@@ -1,6 +1,6 @@
 # data-qd-175 | Museum collection loan tracking
 
-Builds an item-level custody timeline from loan and condition events, flags due/overdue loans, and detects events outside an active loan interval. Python 3.11+; standard library only.
+Builds an item-level custody timeline from loan and condition events, flags due/overdue loans, detects events outside an active loan interval, and projects per-object physical custody including conflicts where concurrent loans claim the same object. Python 3.11+; standard library only.
 
 ```sh
 uv venv --python 3.12 .venv

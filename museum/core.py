@@ -1,6 +1,45 @@
 from datetime import date, datetime
 
 
+def _object_custody(loans, events):
+    """Project physical custody per object from valid dispatch/receipt events."""
+    relevant = []
+    for event in events:
+        if event["type"] not in ("dispatch", "receipt"):
+            continue
+        loan = loans[event["loan_id"]]
+        start, due = date.fromisoformat(loan["start"]), date.fromisoformat(loan["due"])
+        stamp = datetime.fromisoformat(event["time"])
+        if start <= stamp.date() <= due:
+            relevant.append((stamp, event))
+    relevant.sort(key=lambda item: (item[0], item[1]["id"]))
+
+    object_ids = {loan["object_id"] for loan in loans.values()}
+    active_by_object = {object_id: {} for object_id in object_ids}
+    conflicts_by_object = {object_id: [] for object_id in object_ids}
+
+    for _, event in relevant:
+        object_id = loans[event["loan_id"]]["object_id"]
+        active = active_by_object[object_id]
+        if event["type"] == "dispatch":
+            for active_loan_id in sorted(active, key=lambda loan_id: active[loan_id]):
+                conflicts_by_object[object_id].append({
+                    "object_id": object_id,
+                    "new_dispatch_event_id": event["id"],
+                    "earlier_dispatch_event_id": active[active_loan_id],
+                })
+            active[event["loan_id"]] = event["id"]
+        else:
+            active.pop(event["loan_id"], None)
+
+    return [
+        {"object_id": object_id,
+         "active_loan_ids": sorted(active_by_object[object_id]),
+         "conflicts": conflicts_by_object[object_id]}
+        for object_id in sorted(object_ids)
+    ]
+
+
 def audit(data):
     as_of = date.fromisoformat(data["as_of"])
     loans = {x["id"]: x for x in data["loans"]}
@@ -44,4 +83,5 @@ def audit(data):
                        "condition_codes": [e["condition_code"] for e in timeline if e["type"] == "condition" and e.get("condition_code")],
                        "exceptions": sorted(set(exceptions)), "timeline": [e["id"] for e in timeline]})
     return {"loans": result, "overdue": sum(x["status"] == "overdue" for x in result),
-            "exceptions": sum(bool(x["exceptions"]) for x in result)}
+            "exceptions": sum(bool(x["exceptions"]) for x in result),
+            "object_custody": _object_custody(loans, events)}
